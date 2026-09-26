@@ -963,6 +963,61 @@ start_server {
         assert_equal 4 [r XLEN mystream]
     } {} {external:skip}
 
+    test {XADD IDMP entries expire after duration even when the stream ID is in the future} {
+        r DEL idmpnorm{t}
+        r DEL idmpfuture{t}
+
+        # Set IDMP-DURATION before inserting entries, since XCFGSET
+        # clears existing entries when the duration changes.
+        r XADD idmpnorm{t} IDMP p1 "init" * field "init"
+        r XCFGSET idmpnorm{t} IDMP-DURATION 2
+        r XADD idmpfuture{t} IDMP p1 "init" * field "init"
+        r XCFGSET idmpfuture{t} IDMP-DURATION 2
+
+        # Normal group: the record is stamped with a wall-clock auto ID.
+        set norm_id [r XADD idmpnorm{t} IDMP p1 "req-1" * field "v1"]
+
+        # Future group: push last_id beyond the wall clock, then the next
+        # auto ID inherits that timestamp and the IDMP record is stamped
+        # with it (see #15836).
+        r XADD idmpfuture{t} 2999999999999-0 f "seed"
+        set future_id [r XADD idmpfuture{t} IDMP p1 "req-1" * field "v1"]
+        assert {[lindex [split $future_id -] 0] >= 2999999999999}
+
+        # Within the window both producers dedupe to their original IDs
+        # without appending new entries.
+        assert_equal $norm_id [r XADD idmpnorm{t} IDMP p1 "req-1" * field "dup"]
+        assert_equal $future_id [r XADD idmpfuture{t} IDMP p1 "req-1" * field "dup"]
+        assert_equal 1 [dict get [r XINFO STREAM idmpnorm{t}] iids-tracked]
+        assert_equal 1 [dict get [r XINFO STREAM idmpfuture{t}] iids-tracked]
+        assert_equal 2 [r XLEN idmpnorm{t}]
+        assert_equal 3 [r XLEN idmpfuture{t}]
+
+        # After the duration plus cron scheduling slack, the normal
+        # group's record must be cleaned up.
+        wait_for_condition 50 100 {
+            [dict get [r XINFO STREAM idmpnorm{t}] iids-tracked] == 0
+        } else {
+            fail "IDMP records were not cleaned up after their duration"
+        }
+
+        # The future group's record must be cleaned up as well; expiry
+        # must not depend on the age of the associated stream ID (#15836).
+        wait_for_condition 50 100 {
+            [dict get [r XINFO STREAM idmpfuture{t}] iids-tracked] == 0
+        } else {
+            fail "IDMP record with a future stream ID was not cleaned up after its duration"
+        }
+
+        # Both IIDs must be re-addable as new entries.
+        set norm_new [r XADD idmpnorm{t} IDMP p1 "req-1" * field "new"]
+        set future_new [r XADD idmpfuture{t} IDMP p1 "req-1" * field "new"]
+        assert {$norm_new ne $norm_id}
+        assert {$future_new ne $future_id}
+        assert_equal 3 [r XLEN idmpnorm{t}]
+        assert_equal 4 [r XLEN idmpfuture{t}]
+    }
+
     test {XADD IDMP tracking survives SWAPDB} {
         # Use dedicated clients for DB 0 and DB 1 so that `r` stays on
         # DB 9 (the test default).  If any assertion fails mid-test,
